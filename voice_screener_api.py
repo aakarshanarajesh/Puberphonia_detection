@@ -411,6 +411,34 @@ def health():
     })
 
 
+@app.route("/s3-test", methods=["GET"])
+def s3_test():
+    """Write a tiny test JSON object to S3 to verify Render env + AWS access."""
+    if not storage.is_enabled():
+        return jsonify({
+            "status": "error",
+            "message": "S3 is not enabled or not configured",
+            "s3_env_enabled": os.getenv("S3_ENABLED"),
+            "s3_env_bucket": os.getenv("AWS_S3_BUCKET"),
+            "s3_env_region": os.getenv("AWS_REGION"),
+            "s3_enabled": storage.is_enabled(),
+        }), 500
+
+    try:
+        key = storage.build_key("debug", "s3-test.json", "render")
+        uri = storage.upload_json({
+            "status": "ok",
+            "message": "Render can write to S3",
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "bucket": storage.bucket,
+            "region": storage.region,
+        }, key)
+        return jsonify({"status": "ok", "s3_uri": uri, "key": key})
+    except Exception as exc:
+        print(f"S3 TEST ERROR: {exc}")
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
+
 @app.route("/results", methods=["GET"])
 def get_results():
     """Preview latest results."""
