@@ -2,5 +2,5 @@ services:
   - type: web
     name: puberphonia
     env: python
-    buildCommand: apt-get update && apt-get install -y ffmpeg && pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
+    buildCommand: apt-get update && apt-get install -y ffmpeg && pip install --upgrade pip wheel && pip install setuptools==69.5.1 && pip install -r requirements.txt
     startCommand: gunicorn voice_screener_api:app
