@@ -18,15 +18,22 @@ class S3Storage:
     """Small wrapper around S3 for uploaded audio and analysis outputs."""
 
     def __init__(self) -> None:
-        self.bucket = os.getenv("AWS_S3_BUCKET")
-        self.region = os.getenv("AWS_REGION", "eu-north-1")
-        self.prefix = os.getenv("AWS_S3_PREFIX", "puberphonia").strip("/")
-        self.enabled = os.getenv("S3_ENABLED", "false").lower() in {"1", "true", "yes"}
+        self.bucket = self._env("AWS_S3_BUCKET")
+        self.region = self._env("AWS_REGION", "eu-north-1")
+        self.prefix = self._env("AWS_S3_PREFIX", "puberphonia").strip("/")
+        self.enabled = self._env("S3_ENABLED", "false").lower() in {"1", "true", "yes"}
+        self.access_key_id = self._env("AWS_ACCESS_KEY_ID")
+        self.secret_access_key = self._env("AWS_SECRET_ACCESS_KEY")
 
         if self.enabled and not self.bucket:
             raise RuntimeError("AWS_S3_BUCKET is required when S3_ENABLED=true")
 
-        self.client = boto3.client("s3", region_name=self.region) if self.enabled else None
+        client_kwargs = {"region_name": self.region}
+        if self.access_key_id and self.secret_access_key:
+            client_kwargs["aws_access_key_id"] = self.access_key_id
+            client_kwargs["aws_secret_access_key"] = self.secret_access_key
+
+        self.client = boto3.client("s3", **client_kwargs) if self.enabled else None
         logger.info(
             "S3 storage %s | bucket=%s | region=%s | prefix=%s",
             "enabled" if self.enabled else "disabled",
@@ -113,3 +120,7 @@ class S3Storage:
         name = Path(value or "recording.wav").name
         cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in name)
         return cleaned or "recording.wav"
+
+    @staticmethod
+    def _env(name: str, default: str = "") -> str:
+        return os.getenv(name, default).strip()
