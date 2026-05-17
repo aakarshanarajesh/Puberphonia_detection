@@ -808,9 +808,15 @@ function stopRecording() {
                 method: "POST",
                 body: formData
             });
-            const data = await response.json();
+            const responseText = await response.text();
+            let data;
+            try {
+                data = JSON.parse(responseText);
+            } catch (parseErr) {
+                throw new Error(responseText || `Server returned ${response.status}`);
+            }
 
-            if (data.status === "success") {
+            if (response.ok && data.status === "success") {
                 displayResults(data);
             } else {
                 alert("Analysis failed: " + data.message);
@@ -818,7 +824,7 @@ function stopRecording() {
             }
         } catch (err) {
             console.error(err);
-            alert("Could not connect to analysis server. Make sure voice_screener_api.py is running.");
+            alert(`Could not complete analysis: ${err.message}`);
             resultMain.textContent = "Server Error";
         }
     };
