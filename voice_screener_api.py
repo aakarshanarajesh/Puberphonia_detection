@@ -1,22 +1,34 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import numpy as np
 import librosa
 import io
+import logging
 import subprocess
 import tempfile
 import os
 import csv
 from datetime import datetime
 import pandas as pd
+from werkzeug.utils import secure_filename
+
+from s3_storage import S3Storage
 
 
 # ==========================================================
 # CLINICAL VOICE SCREENER API – PRODUCTION READY (Dec 2025)
 # FIXED: 90Hz pYIN confidence validation
 # ==========================================================
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 app = Flask(__name__)
 CORS(app)
+storage = S3Storage()
+print(
+    "S3 DEBUG:",
+    os.getenv("S3_ENABLED"),
+    os.getenv("AWS_S3_BUCKET"),
+    os.getenv("AWS_REGION"),
+)
 
 
 # ✅ FIXED: PORTABLE PATH (works on Windows/Linux/Mac)
@@ -41,12 +53,21 @@ FIELDNAMES = [
 
 def append_result_row(row: dict):
     """Create CSV if needed and append one result row."""
-    file_exists = os.path.exists(RESULTS_FILE)
-    with open(RESULTS_FILE, mode="a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-        if not file_exists:
+    target_file = RESULTS_FILE
+    try:
+        file_exists = os.path.exists(target_file)
+        with open(target_file, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+    except PermissionError:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        target_file = os.path.join(os.path.dirname(__file__), f"voice_results_{stamp}.csv")
+        with open(target_file, mode="w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
             writer.writeheader()
-        writer.writerow(row)
+            writer.writerow(row)
     print(f"✅ SAVED TO CSV: {row['patient_id']} | F0: {row['median_f0_hz']}Hz | Conf: {row.get('confidence_high', 'N/A')}")
 
 
@@ -59,6 +80,44 @@ def save_excel():
             print(f"✅ EXCEL SAVED: {EXCEL_FILE}")
         except Exception as e:
             print(f"⚠️ Excel save failed: {e}")
+
+
+def upload_results_snapshot_to_s3():
+    """Optionally store latest CSV/XLSX result snapshots in S3."""
+    if not storage.is_enabled():
+        return {}
+
+    uploaded = {}
+    if os.path.exists(RESULTS_FILE):
+        try:
+            uploaded["csv_s3_uri"] = storage.upload_file(
+                RESULTS_FILE,
+                f"{storage.prefix}/results/voice_results.csv",
+                content_type="text/csv",
+            )
+        except RuntimeError as exc:
+            uploaded["warning"] = str(exc)
+    if os.path.exists(EXCEL_FILE):
+        try:
+            uploaded["excel_s3_uri"] = storage.upload_file(
+                EXCEL_FILE,
+                f"{storage.prefix}/results/voice_results.xlsx",
+                content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except RuntimeError as exc:
+            uploaded["warning"] = str(exc)
+    return uploaded
+
+
+def upload_analysis_json_to_s3(response_payload, patient_id):
+    if not storage.is_enabled():
+        return
+
+    try:
+        result_key = storage.build_key("results", "analysis.json", patient_id)
+        response_payload["storage"]["analysis_json_s3_uri"] = storage.upload_json(response_payload, result_key)
+    except RuntimeError as exc:
+        response_payload["storage"]["warning"] = str(exc)
 
 
 # ---- Validated thresholds (Dec 2025) ----
@@ -126,20 +185,74 @@ def index():
     '''
 
 
+@app.route("/voice_screener.html")
+def voice_screener_page():
+    return send_from_directory(os.path.dirname(__file__), "voice_screener.html")
+
+
 @app.route("/analyze", methods=["POST"])
 def analyze():
     """Receive audio → pYIN → metrics → classification."""
     try:
+        print("API HIT: Received /analyze request")
+        print(f"API DEBUG: request.files keys = {list(request.files.keys())}")
+        print(f"API DEBUG: request.form = {dict(request.form)}")
         if "audio" not in request.files:
+            print("API ERROR: No audio file found in request.files")
             return jsonify({"status": "error", "message": "No audio file"}), 400
 
         audio_file = request.files["audio"]
+        patient_id = request.form.get("patient_id", "anonymous")
+        age = request.form.get("age", "unknown")
+        original_filename = secure_filename(audio_file.filename or "recording.wav")
         raw_bytes = audio_file.read()
+        print(f"API DEBUG: Received audio filename={original_filename}, bytes={len(raw_bytes)}")
+        print(f"API DEBUG: S3 enabled={storage.is_enabled()}, bucket={storage.bucket}, region={storage.region}")
 
-        # 1. Decode to WAV
+        # 1. Upload original recording to S3 before processing.
+        original_s3_uri = ""
+        original_s3_key = ""
+        storage_warning = None
+        if storage.is_enabled():
+            try:
+                original_s3_key = storage.build_key("raw", original_filename, patient_id)
+                print(f"Uploading raw audio to S3: s3://{storage.bucket}/{original_s3_key}")
+                original_s3_uri = storage.upload_bytes(
+                    raw_bytes,
+                    original_s3_key,
+                    content_type=audio_file.mimetype or "application/octet-stream",
+                    metadata={"patient_id": patient_id, "age": age},
+                )
+                print(f"Raw audio upload success: {original_s3_uri}")
+            except RuntimeError as exc:
+                storage_warning = str(exc)
+                original_s3_key = ""
+                print(f"S3 ERROR raw audio upload failed: {exc}")
+        else:
+            print("S3 SKIPPED: S3_ENABLED is false or storage is not configured")
+
+        # 2. Decode to WAV
+        print("API DEBUG: Starting FFmpeg decode")
         wav_bytes = decode_to_wav_bytes(raw_bytes)
+        print(f"API DEBUG: FFmpeg decode complete, wav bytes={len(wav_bytes)}")
+        wav_s3_uri = ""
+        wav_s3_key = ""
+        if storage.is_enabled() and not storage_warning:
+            try:
+                wav_s3_key = storage.build_key("processed-wav", f"{original_filename}.wav", patient_id)
+                print(f"Uploading processed WAV to S3: s3://{storage.bucket}/{wav_s3_key}")
+                wav_s3_uri = storage.upload_bytes(
+                    wav_bytes,
+                    wav_s3_key,
+                    content_type="audio/wav",
+                    metadata={"patient_id": patient_id, "age": age, "source_key": original_s3_key},
+                )
+                print(f"Processed WAV upload success: {wav_s3_uri}")
+            except RuntimeError as exc:
+                storage_warning = str(exc)
+                print(f"S3 ERROR processed WAV upload failed: {exc}")
 
-        # 2. Load with librosa
+        # 3. Load with librosa
         y, sr = librosa.load(io.BytesIO(wav_bytes), sr=None, mono=True)
 
         if len(y) < sr // 2:  # <0.5s
@@ -162,7 +275,7 @@ def analyze():
 
         if len(f0_clean) < 2:
             # Let frontend fall back to graph
-            return jsonify({
+            response_payload = {
                 "status": "success",
                 "metrics": {
                     "median_f0_hz": 0.0,
@@ -180,8 +293,16 @@ def analyze():
                     "warning": "Too few voiced frames – use graph estimate / retry louder."
                 },
                 "f0_values": [float(x) if not np.isnan(x) else 0 for x in f0],
-                "time_values": times.tolist()
-            }), 200
+                "time_values": times.tolist(),
+                "storage": {
+                    "raw_audio_s3_uri": original_s3_uri,
+                    "processed_wav_s3_uri": wav_s3_uri,
+                    "raw_audio_download_url": storage.create_presigned_url(original_s3_key) if original_s3_key else "",
+                    "warning": storage_warning,
+                },
+            }
+            upload_analysis_json_to_s3(response_payload, patient_id)
+            return jsonify(response_payload), 200
 
 
         # 5. Metrics
@@ -207,7 +328,7 @@ def analyze():
 
         print(f"✅ ANALYSIS: F0={median_f0:.1f}Hz | Std={std_f0:.1f}Hz | Jitter={jitter:.2f}% | {pitch_class} | Conf:{confidence_ok} ({voiced_count}f, p:{mean_voiced_prob:.3f})")
        
-        return jsonify({
+        response_payload = {
             "status": "success",
             "metrics": {
                 "median_f0_hz": round(median_f0, 1),
@@ -225,8 +346,16 @@ def analyze():
                 "warning": "Low confidence: too few voiced frames" if not confidence_ok else None
             },
             "f0_values": [float(x) if not np.isnan(x) else 0 for x in f0],
-            "time_values": times.tolist()
-        })
+            "time_values": times.tolist(),
+            "storage": {
+                "raw_audio_s3_uri": original_s3_uri,
+                "processed_wav_s3_uri": wav_s3_uri,
+                "raw_audio_download_url": storage.create_presigned_url(original_s3_key) if original_s3_key else "",
+                "warning": storage_warning,
+            },
+        }
+        upload_analysis_json_to_s3(response_payload, patient_id)
+        return jsonify(response_payload)
 
     except Exception as e:
         print(f"❌ Analysis error: {e}")
@@ -239,7 +368,7 @@ def analyze():
 def save_result():
     """Save clinical result to CSV + Excel."""
     try:
-        data = request.get_json(force=True)
+        data = request.get_json(silent=True) or {}
 
         row = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -257,8 +386,12 @@ def save_result():
 
         append_result_row(row)
         save_excel()  # Auto-convert to Excel
+        try:
+            uploaded = upload_results_snapshot_to_s3()
+        except Exception as exc:
+            uploaded = {"warning": f"Result saved locally, but S3 result upload failed: {exc}"}
         
-        return jsonify({"status": "ok"}), 200
+        return jsonify({"status": "ok", "storage": uploaded}), 200
         
     except Exception as e:
         print(f"❌ Save error: {e}")
@@ -267,7 +400,15 @@ def save_result():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "results_file": RESULTS_FILE})
+    return jsonify({
+        "status": "ok",
+        "results_file": RESULTS_FILE,
+        "s3_env_enabled": os.getenv("S3_ENABLED"),
+        "s3_env_bucket": os.getenv("AWS_S3_BUCKET"),
+        "s3_env_region": os.getenv("AWS_REGION"),
+        "s3_enabled": storage.is_enabled(),
+        "s3_bucket": storage.bucket if storage.is_enabled() else None,
+    })
 
 
 @app.route("/results", methods=["GET"])
