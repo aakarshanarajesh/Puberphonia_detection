@@ -501,6 +501,7 @@ function getQueryParam(key){
 }
 const PATIENT_ID = getQueryParam('patientId');
 const PATIENT_AGE = getQueryParam('age');
+const API_BASE = 'https://puberphonia-detection.onrender.com';
 
 document.addEventListener('DOMContentLoaded', () => {
   const el = document.getElementById('patientInfo');
@@ -799,9 +800,11 @@ function stopRecording() {
 
         const formData = new FormData();
         formData.append("audio", audioBlob, "recording.wav");
+        formData.append("patient_id", PATIENT_ID || "anonymous");
+        formData.append("age", ageInput.value || "unknown");
 
         try {
-            const response = await fetch("http://127.0.0.1:5000/analyze", {
+            const response = await fetch('https://puberphonia-detection.onrender.com/analyze', {
                 method: "POST",
                 body: formData
             });
@@ -824,7 +827,7 @@ function stopRecording() {
 async function saveResultToServer(metrics, classification) {
     autoSaveTimeout = setTimeout(async () => {
         try {
-            const response = await fetch("http://127.0.0.1:5000/save-result", {
+            const response = await fetch('https://puberphonia-detection.onrender.com/save-result', {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -956,7 +959,7 @@ async function manualSaveResult() {
   const conf = window.currentConf || { voiced_frames: 0, mean_voiced_prob: 0, is_high: false };
 
   try {
-    const response = await fetch("http://127.0.0.1:5000/save-result", {
+    const response = await fetch('https://puberphonia-detection.onrender.com/save-result', {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -975,9 +978,19 @@ async function manualSaveResult() {
     if (response.ok) {
       console.log("✅ MANUALLY SAVED:", PATIENT_ID);
       resetAll();
+    } else {
+      let message = "Save failed. Try again.";
+      try {
+        const errorData = await response.json();
+        message = errorData.message || message;
+      } catch (parseErr) {
+        message = await response.text() || message;
+      }
+      alert(message);
     }
   } catch (err) {
-    alert("Save failed. Try again.");
+    console.error(err);
+    alert(`Save failed: ${err.message}`);
   }
 }
 
